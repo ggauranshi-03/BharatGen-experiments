@@ -1,0 +1,1030 @@
+# import math
+# import argparse
+# import os
+# import torch
+# from torch.optim.optimizer import Optimizer
+
+# # --- Standard NeMo Imports ---
+# from nemo import lightning as nl
+# from nemo.collections import llm
+# from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
+# from nemo.collections.llm.gpt.data import PreTrainingDataModule
+# from nemo.lightning.pytorch.optim import OptimizerModule
+
+# # --- REAL IMPORTS from PyTorch Lightning ---
+# from lightning.pytorch.loggers import WandbLogger
+# from lightning.pytorch.callbacks import ModelCheckpoint, Callback
+# from megatron.core.optimizer import OptimizerConfig
+# from nemo.lightning.pytorch.optim import OptimizerModule
+
+# # ============================================================================ #
+# #                            Muon & mu-GREATS Math                             #
+# # ============================================================================ #
+# def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
+#     """
+#     Newton-Schulz iteration to compute the zero-power / orthogonalization.
+#     """
+#     assert G.ndim == 2, f"Expected 2D tensor, got {G.ndim}D"
+    
+#     a, b, c = (3.4445, -4.7750, 2.0315)
+    
+#     if G.size(0) > G.size(1):
+#         G = G.t()
+#         transposed = True
+#     else:
+#         transposed = False
+    
+#     norm = G.norm() + eps
+#     X = G / norm
+#     X = X.bfloat16()
+    
+#     for _ in range(steps):
+#         A = X.t() @ X
+#         B = b * A + c * A @ A
+#         X = X @ (a * torch.eye(X.size(1), device=X.device, dtype=X.dtype) + B)
+    
+#     if transposed:
+#         X = X.t()
+    
+#     return X.float()
+
+# def project_to_stiefel_tangent(theta, grad):
+#     """
+#     mu-GREATS Eq 12: Pi_T(grad) = grad - theta * symm(theta^T * grad)
+#     Projects the Euclidean gradient onto the Stiefel manifold tangent space.
+#     """
+#     # Ensure precision match
+#     theta = theta.to(grad.dtype)
+    
+#     # Compute symm(theta^T * grad)
+#     theta_t_grad = theta.t() @ grad
+#     symm_term = (theta_t_grad + theta_t_grad.t()) / 2.0
+    
+#     # Final projection
+#     projection = grad - (theta @ symm_term)
+#     return projection
+
+# # ============================================================================ #
+# #                             Hybrid Muon Optimizer                            #
+# # ============================================================================ #
+# class Muon(Optimizer):
+#     def __init__(
+#         self,
+#         params,
+#         lr: float = 0.02,                
+#         momentum: float = 0.95,
+#         nesterov: bool = True,
+#         ns_steps: int = 5,
+#         adam_w_lr: float = 0.003,        
+#         adam_w_betas: tuple = (0.9, 0.999),
+#         weight_decay: float = 0.0,
+#         eps: float = 1e-8,
+#     ):
+#         defaults = dict(
+#             lr=lr, 
+#             momentum=momentum, 
+#             nesterov=nesterov, 
+#             ns_steps=ns_steps,
+#             adam_w_lr=adam_w_lr,
+#             adam_w_betas=adam_w_betas,
+#             weight_decay=weight_decay,
+#             eps=eps
+#         )
+#         super().__init__(params, defaults)
+#         self.log_interval = 10  
+#         self.batch_utility_score = 0.0 # Store mu-GREATS utility
+
+#     def _classify_param(self, p):
+#         # Exclude embeddings and 1D tensors (norms/biases)
+#         is_embedding = (p.ndim == 2 and p.size(0) > 10000)
+#         is_linear_weight = (p.ndim == 2 and not is_embedding)
+#         return is_linear_weight
+
+#     @torch.no_grad()
+#     def step(self, closure=None):
+#         loss = None
+#         if closure is not None:
+#             with torch.enable_grad():
+#                 loss = closure()
+
+#         muon_updates = 0
+#         adam_updates = 0
+#         skipped = 0
+#         total_utility = 0.0
+
+#         for group in self.param_groups:
+#             lr = group['lr']
+#             momentum = group['momentum']
+#             nesterov = group['nesterov']
+#             ns_steps = group['ns_steps']
+#             weight_decay = group['weight_decay']
+            
+#             adam_lr = group['adam_w_lr']
+#             beta1, beta2 = group['adam_w_betas']
+#             eps = group['eps']
+
+#             for p in group['params']:
+#                 grad = p.grad
+#                 if grad is None and hasattr(p, 'main_grad'):
+#                     grad = p.main_grad
+
+#                 if grad is None:
+#                     skipped += 1
+#                     continue
+                
+#                 state = self.state[p]
+
+#                 if len(state) == 0:
+#                     state['step'] = 0
+#                     state['use_muon'] = self._classify_param(p)
+#                     state['momentum_buffer'] = torch.zeros_like(p)
+#                     state['exp_avg'] = torch.zeros_like(p)
+#                     state['exp_avg_sq'] = torch.zeros_like(p)
+
+#                 state['step'] += 1
+#                 use_muon = state['use_muon']
+
+#                 if use_muon:
+#                     muon_updates += 1
+                    
+#                     # --- mu-GREATS Utility Calculation ---
+#                     # Since we aren't filtering subsets (w=1), we measure the 
+#                     # Riemannian magnitude of the current batch's gradient.
+#                     stiefel_grad = project_to_stiefel_tangent(p, grad)
+#                     total_utility += torch.norm(stiefel_grad, p='fro').item()
+                    
+#                     # Weight decay
+#                     if weight_decay != 0:
+#                         p.mul_(1 - lr * weight_decay)
+                    
+#                     buf = state['momentum_buffer']
+#                     buf.mul_(momentum).add_(grad, alpha=1 - momentum)
+                    
+#                     if nesterov:
+#                         g = buf.clone().add_(grad, alpha=1 - momentum)
+#                     else:
+#                         g = buf
+                    
+#                     # Newton-Schulz
+#                     g_ortho = zeropower_via_newtonschulz5(g, steps=ns_steps)
+                    
+#                     rows, cols = g.size()
+#                     scale = max(1, rows / cols) ** 0.5
+#                     g_ortho *= scale
+                    
+#                     p.add_(g_ortho, alpha=-lr)
+
+#                 else:
+#                     adam_updates += 1
+                    
+#                     if weight_decay != 0:
+#                         p.mul_(1 - adam_lr * weight_decay)
+                    
+#                     exp_avg = state['exp_avg']
+#                     exp_avg_sq = state['exp_avg_sq']
+                    
+#                     exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+#                     exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                    
+#                     bias_correction1 = 1 - beta1 ** state['step']
+#                     bias_correction2 = 1 - beta2 ** state['step']
+                    
+#                     step_size = adam_lr / bias_correction1
+#                     bias_correction2_sqrt = math.sqrt(bias_correction2)
+                    
+#                     denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+#                     p.addcdiv_(exp_avg, denom, value=-step_size)
+
+#         self.batch_utility_score = total_utility
+
+#         return loss
+
+# # ============================================================================ #
+# #                            Module & Callbacks                                #
+# # ============================================================================ #
+# # class MuonOptimizerModule(OptimizerModule):
+#     # def __init__(self, lr: float, adam_w_lr: float, weight_decay: float, lr_scheduler=None):
+#     #     super().__init__(lr_scheduler=lr_scheduler)
+#     #     self.lr = lr
+#     #     self.adam_w_lr = adam_w_lr
+#     #     self.weight_decay = weight_decay
+        
+#     #     # 2. Add this specific attribute. 
+#     #     # NeMo checks for this to verify how to handle gradients in distributed mode.
+#     #     self.config = OptimizerConfig(
+#     #         lr=self.lr,
+#     #         weight_decay=self.weight_decay,
+#     #         bf16=True,             # Matches your bfloat16 training
+#     #     )
+
+#     # def optimizers(self, model):
+#     #     params = [p for p in model.parameters() if p.requires_grad]
+#     #     return [Muon(
+#     #         params,
+#     #         lr=self.lr,
+#     #         adam_w_lr=self.adam_w_lr,
+#     #         weight_decay=self.weight_decay,
+#     #     )]
+
+# class MuonOptimizerModule(OptimizerModule):
+#     def __init__(self, lr: float, adam_w_lr: float, weight_decay: float, lr_scheduler=None):
+#         super().__init__(lr_scheduler=lr_scheduler)
+#         self.lr = lr
+#         self.adam_w_lr = adam_w_lr
+#         self.weight_decay = weight_decay
+        
+#         # This attribute is required for NeMo 2.0 Distributed Data Parallel
+#         from megatron.core.optimizer import OptimizerConfig
+#         self.config = OptimizerConfig(
+#             lr=self.lr,
+#             weight_decay=self.weight_decay,
+#             bf16=True, # Matches your Llama 3 bfloat16 setup
+#         )
+
+#     def optimizers(self, model):
+#         # We filter for parameters that have grad enabled by LoRA
+#         params = [p for p in model.parameters() if p.requires_grad]
+        
+#         # Debug print to confirm we found the LoRA weights
+#         print(f"DEBUG: Found {len(params)} trainable parameter tensors for Muon.")
+        
+#         if not params:
+#             raise ValueError("No trainable parameters found. Check your LoRA target_modules!")
+
+#         return [Muon(
+#             params,
+#             lr=self.lr,
+#             adam_w_lr=self.adam_w_lr,
+#             weight_decay=self.weight_decay,
+#         )]
+
+# class MuonUtilityCallback(Callback):
+#     """Logs the mu-GREATS Stiefel tangent projection magnitude"""
+#     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+#         for opt in trainer.optimizers:
+#             if isinstance(opt, Muon):
+#                 pl_module.log("mu_greats_batch_utility", opt.batch_utility_score, prog_bar=True, on_step=True)
+
+# class PerplexityCallback(Callback):
+#     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+#         loss = outputs.get("loss") or outputs.get("reduced_train_loss") if isinstance(outputs, dict) else outputs
+#         if loss is not None:
+#             ppl = torch.exp(loss.detach())
+#             pl_module.log("train_perplexity", ppl, prog_bar=True, on_step=True)
+
+# # ============================================================================ #
+# #                                 Main Function                                #
+# # ============================================================================ #
+# def main():
+#     parser = argparse.ArgumentParser(description="NeMo Llama3-8B LoRA with mu-GREATS Utility")
+#     parser.add_argument("--name", type=str, default="llama3_8b_lora_muon", help="Experiment name")
+#     parser.add_argument("--exp_dir", type=str, default="experiments", help="Experiments directory")
+#     parser.add_argument("--seq_length", type=int, default=2048)
+#     parser.add_argument("--global_batch_size", type=int, default=16)
+#     parser.add_argument("--micro_batch_size", type=int, default=1)
+    
+#     # Optimizer Config
+#     parser.add_argument("--lr", type=float, default=5e-4, help="Muon LR for Llama3 8B (from paper)")
+#     parser.add_argument("--adam_lr", type=float, default=5e-5, help="AdamW LR")
+#     parser.add_argument("--weight_decay", type=float, default=0.0)
+#     args = parser.parse_args()
+
+#     exp_base_dir = os.path.join(args.exp_dir, args.name)
+#     os.makedirs(exp_base_dir, exist_ok=True)
+
+#     # 1. Initialize Llama 3 8B Configuration
+#     model_config = llm.LlamaConfig(
+#         num_layers=32,
+#         hidden_size=4096,
+#         ffn_hidden_size=14336,
+#         num_attention_heads=32,
+#         num_query_groups=8,          # GQA for Llama 3
+#         seq_length=args.seq_length,
+    
+#         # Turn off anything that needs TE/Apex fused kernels
+#         apply_rope_fusion=False,
+#         persist_layer_norm=False,
+#         normalization="RMSNorm",
+#     )
+#     model_config.fused_layer_norm = False
+#     tokenizer = AutoTokenizer(pretrained_model_name="meta-llama/Meta-Llama-3-8B")
+
+#     # 2. Vanilla LoRA Configuration
+#     lora_config = llm.peft.LoRA(
+#         target_modules=['linear_qkv', 'linear_proj', 'linear_fc1', 'linear_fc2'],        
+#         dim=64,
+#         alpha=128,
+#         dropout=0.05
+#     )
+
+#     optimizer_arg = MuonOptimizerModule(
+#         lr=args.lr,
+#         adam_w_lr=args.adam_lr,
+#         weight_decay=args.weight_decay
+#     )
+
+#     # 3. Model Definition with PEFT
+#     model = llm.LlamaModel(
+#         config=model_config, 
+#         tokenizer=tokenizer,
+#         optim=optimizer_arg
+#     )
+#     # Apply LoRA
+#     # model.add_adapter(lora_config)
+
+#     data = PreTrainingDataModule(
+#         paths={
+#             "train": [1.0, "data/my_gpt_data_text_document"],
+#             "validation": ["data/my_gpt_data_text_document"],
+#             "test": ["data/my_gpt_data_text_document"],
+#         },
+#         global_batch_size=args.global_batch_size,
+#         micro_batch_size=args.micro_batch_size,
+#         seq_length=args.seq_length,
+#         tokenizer=tokenizer,
+#         num_workers=8,
+#     )
+
+#     strategy = nl.MegatronStrategy(
+#         tensor_model_parallel_size=1,
+#         pipeline_model_parallel_size=1,
+#         pipeline_dtype=torch.bfloat16,
+#         ddp="megatron",  
+#         find_unused_parameters=False,
+#     )
+
+#     trainer = nl.Trainer(
+#         devices=1,
+#         num_nodes=1,
+#         max_steps=150,
+#         accelerator="gpu",
+#         strategy=strategy,
+#         precision="bf16-true",
+#         log_every_n_steps=1,
+#         callbacks=[
+#             PerplexityCallback(), 
+#             MuonUtilityCallback() # <-- Logs mu-GREATS utility
+#         ],
+#         gradient_clip_val=1.0,
+#     )
+
+#     print(f"\n{'='*70}")
+#     print(f"[START] Llama3-8B LoRA + Muon + mu-GREATS Tracking")
+#     print(f"{'='*70}\n")
+    
+#     llm.finetune(
+#         model=model,
+#         data=data,
+#         trainer=trainer,
+#         peft=lora_config,
+#         resume=nl.AutoResume(resume_if_exists=False),
+#     )
+
+# if __name__ == "__main__":
+#     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# import math
+# import argparse
+# import os
+# import torch
+# import torch.nn as nn
+# from torch.optim.optimizer import Optimizer
+# from torch.utils.data import DataLoader, Dataset
+
+# import pytorch_lightning as pl
+# from lightning.pytorch.callbacks import Callback
+# from lightning.pytorch.strategies import DDPStrategy
+
+# from transformers import AutoTokenizer, AutoModelForCausalLM
+# from peft import LoraConfig, get_peft_model, TaskType
+# from datasets import load_dataset
+
+
+# # ============================================================================ #
+# #                            Muon & mu-GREATS Math                             #
+# #                          (UNCHANGED from NeMo version)                       #
+# # ============================================================================ #
+# def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
+#     assert G.ndim == 2
+#     a, b, c = (3.4445, -4.7750, 2.0315)
+#     if G.size(0) > G.size(1):
+#         G = G.t(); transposed = True
+#     else:
+#         transposed = False
+#     norm = G.norm() + eps
+#     X = G / norm
+#     X = X.bfloat16()
+#     for _ in range(steps):
+#         A = X.t() @ X
+#         B = b * A + c * A @ A
+#         X = X @ (a * torch.eye(X.size(1), device=X.device, dtype=X.dtype) + B)
+#     if transposed:
+#         X = X.t()
+#     return X.float()
+
+
+# def project_to_stiefel_tangent(theta, grad):
+#     theta = theta.to(grad.dtype)
+#     theta_t_grad = theta.t() @ grad
+#     symm_term = (theta_t_grad + theta_t_grad.t()) / 2.0
+#     return grad - (theta @ symm_term)
+
+
+# # ============================================================================ #
+# #                        Muon Optimizer (UNCHANGED)                            #
+# # ============================================================================ #
+# class Muon(Optimizer):
+#     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+#                  ns_steps=5, adam_w_lr=0.003, adam_w_betas=(0.9, 0.999),
+#                  weight_decay=0.0, eps=1e-8):
+#         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
+#                         ns_steps=ns_steps, adam_w_lr=adam_w_lr,
+#                         adam_w_betas=adam_w_betas, weight_decay=weight_decay, eps=eps)
+#         super().__init__(params, defaults)
+#         self.batch_utility_score = 0.0
+
+#     def _classify_param(self, p):
+#         is_embedding = (p.ndim == 2 and p.size(0) > 10000)
+#         return p.ndim == 2 and not is_embedding
+
+#     @torch.no_grad()
+#     def step(self, closure=None):
+#         loss = None
+#         if closure is not None:
+#             with torch.enable_grad():
+#                 loss = closure()
+
+#         total_utility = 0.0
+#         for group in self.param_groups:
+#             lr = group['lr']; momentum = group['momentum']
+#             nesterov = group['nesterov']; ns_steps = group['ns_steps']
+#             weight_decay = group['weight_decay']; adam_lr = group['adam_w_lr']
+#             beta1, beta2 = group['adam_w_betas']; eps = group['eps']
+
+#             for p in group['params']:
+#                 grad = p.grad
+#                 if grad is None:
+#                     continue
+#                 state = self.state[p]
+#                 if len(state) == 0:
+#                     state['step'] = 0
+#                     state['use_muon'] = self._classify_param(p)
+#                     state['momentum_buffer'] = torch.zeros_like(p)
+#                     state['exp_avg'] = torch.zeros_like(p)
+#                     state['exp_avg_sq'] = torch.zeros_like(p)
+
+#                 state['step'] += 1
+#                 if state['use_muon']:
+#                     stiefel_grad = project_to_stiefel_tangent(p, grad)
+#                     total_utility += torch.norm(stiefel_grad, p='fro').item()
+#                     if weight_decay != 0:
+#                         p.mul_(1 - lr * weight_decay)
+#                     buf = state['momentum_buffer']
+#                     buf.mul_(momentum).add_(grad, alpha=1 - momentum)
+#                     g = buf.clone().add_(grad, alpha=1 - momentum) if nesterov else buf
+#                     g_ortho = zeropower_via_newtonschulz5(g, steps=ns_steps)
+#                     rows, cols = g.size()
+#                     g_ortho *= max(1, rows / cols) ** 0.5
+#                     p.add_(g_ortho, alpha=-lr)
+#                 else:
+#                     if weight_decay != 0:
+#                         p.mul_(1 - adam_lr * weight_decay)
+#                     exp_avg = state['exp_avg']
+#                     exp_avg_sq = state['exp_avg_sq']
+#                     exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+#                     exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+#                     bc1 = 1 - beta1 ** state['step']
+#                     bc2 = 1 - beta2 ** state['step']
+#                     step_size = adam_lr / bc1
+#                     denom = (exp_avg_sq.sqrt() / math.sqrt(bc2)).add_(eps)
+#                     p.addcdiv_(exp_avg, denom, value=-step_size)
+
+#         self.batch_utility_score = total_utility
+#         return loss
+
+
+# # ============================================================================ #
+# #                        Data: simple text Dataset                             #
+# #  Drop-in replacement for NeMo's PreTrainingDataModule.                      #
+# #  Reads a plain .jsonl or .txt file; swap load_dataset() call as needed.    #
+# # ============================================================================ #
+# class TextDataset(Dataset):
+#     def __init__(self, tokenizer, file_path, seq_length=2048):
+#         self.seq_length = seq_length
+#         raw = load_dataset("text", data_files={"train": file_path}, split="train")
+#         texts = [str(t) for t in raw["text"]]   # PyArrow → plain Python list[str]
+#         tokens = tokenizer(
+#             texts,
+#             truncation=True,
+#             max_length=seq_length,
+#             padding="max_length",
+#             return_tensors="pt",
+#         )
+#         self.input_ids = tokens["input_ids"]
+#         self.attention_mask = tokens["attention_mask"]
+
+#     def __len__(self):
+#         return len(self.input_ids)
+
+#     def __getitem__(self, idx):
+#         ids = self.input_ids[idx]
+#         mask = self.attention_mask[idx]
+#         return {"input_ids": ids, "attention_mask": mask, "labels": ids.clone()}
+
+
+# # ============================================================================ #
+# #                     PyTorch Lightning Module (replaces NeMo)                 #
+# # ============================================================================ #
+# class LlamaLoRALightningModule(pl.LightningModule):
+#     def __init__(self, model_name, lora_config, lr, adam_w_lr, weight_decay):
+#         super().__init__()
+#         self.save_hyperparameters(ignore=["lora_config"])
+#         self.lr = lr
+#         self.adam_w_lr = adam_w_lr
+#         self.weight_decay = weight_decay
+#         self.batch_utility_score = 0.0
+
+#         # Load model in bf16 — no Apex, no TE needed
+#         self.model = AutoModelForCausalLM.from_pretrained(
+#             model_name,
+#             dtype=torch.bfloat16,
+#         )
+#         self.model = get_peft_model(self.model, lora_config)
+#         self.model.print_trainable_parameters()
+
+#     def forward(self, input_ids, attention_mask=None, labels=None):
+#         return self.model(input_ids=input_ids,
+#                           attention_mask=attention_mask,
+#                           labels=labels)
+
+#     def training_step(self, batch, batch_idx):
+#         outputs = self(**batch)
+#         loss = outputs.loss
+#         ppl = torch.exp(loss.detach())
+#         self.log("train_loss", loss, prog_bar=True, on_step=True)
+#         self.log("train_perplexity", ppl, prog_bar=True, on_step=True)
+#         self.log("mu_greats_batch_utility", self.batch_utility_score,
+#                  prog_bar=True, on_step=True)
+#         return loss
+
+#     def on_after_backward(self):
+#         # Capture mu-GREATS utility from the optimizer after grads are computed
+#         for opt in self.trainer.optimizers:
+#             if isinstance(opt, Muon):
+#                 self.batch_utility_score = opt.batch_utility_score
+
+#     def configure_optimizers(self):
+#         params = [p for p in self.parameters() if p.requires_grad]
+#         print(f"[Muon] Trainable LoRA params: {len(params)}")
+#         optimizer = Muon(
+#             params,
+#             lr=self.lr,
+#             adam_w_lr=self.adam_w_lr,
+#             weight_decay=self.weight_decay,
+#         )
+#         return optimizer
+
+
+# # ============================================================================ #
+# #                                Main Function                                 #
+# # ============================================================================ #
+# def main():
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument("--model_name", type=str, default="meta-llama/Meta-Llama-3-8B")
+#     parser.add_argument("--train_file", type=str, default="data/train.txt",
+#                         help="Plain .txt or .jsonl file (one doc per line)")
+#     parser.add_argument("--name", type=str, default="llama3_8b_lora_muon")
+#     parser.add_argument("--seq_length", type=int, default=2048)
+#     parser.add_argument("--global_batch_size", type=int, default=16)
+#     parser.add_argument("--micro_batch_size", type=int, default=1)
+#     parser.add_argument("--lr", type=float, default=5e-4)
+#     parser.add_argument("--adam_lr", type=float, default=5e-5)
+#     parser.add_argument("--weight_decay", type=float, default=0.0)
+#     parser.add_argument("--max_steps", type=int, default=150)
+#     parser.add_argument("--devices", type=int, default=1)
+#     args = parser.parse_args()
+
+#     torch.set_float32_matmul_precision("high")
+
+#     # 1. Tokenizer
+#     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+#     if tokenizer.pad_token is None:
+#         tokenizer.pad_token = tokenizer.eos_token
+
+#     # 2. LoRA config (HuggingFace PEFT — no Apex/Megatron needed)
+#     lora_config = LoraConfig(
+#         task_type=TaskType.CAUSAL_LM,
+#         r=64,
+#         lora_alpha=128,
+#         lora_dropout=0.05,
+#         target_modules=["q_proj", "k_proj", "v_proj",
+#                         "o_proj", "gate_proj", "up_proj", "down_proj"],
+#         bias="none",
+#     )
+
+#     # 3. Lightning module
+#     module = LlamaLoRALightningModule(
+#         model_name=args.model_name,
+#         lora_config=lora_config,
+#         lr=args.lr,
+#         adam_w_lr=args.adam_lr,
+#         weight_decay=args.weight_decay,
+#     )
+
+#     # 4. Data
+#     dataset = TextDataset(tokenizer, args.train_file, seq_length=args.seq_length)
+#     loader = DataLoader(
+#         dataset,
+#         batch_size=args.micro_batch_size,
+#         shuffle=True,
+#         num_workers=4,
+#         pin_memory=True,
+#     )
+
+#     # 5. Trainer — plain DDP, zero NeMo/Megatron/Apex dependencies
+#     strategy = DDPStrategy(find_unused_parameters=False) if args.devices > 1 else "auto"
+#     trainer = pl.Trainer(
+#         devices=args.devices,
+#         num_nodes=1,
+#         max_steps=args.max_steps,
+#         accelerator="gpu",
+#         strategy=strategy,
+#         precision="bf16-true",          # native torch bf16, no Apex needed
+#         log_every_n_steps=1,
+#         gradient_clip_val=1.0,
+#         accumulate_grad_batches=args.global_batch_size // args.micro_batch_size,
+#     )
+
+#     print(f"\n{'='*70}")
+#     print(f"[START] Llama3-8B LoRA + Muon + mu-GREATS (HuggingFace stack)")
+#     print(f"{'='*70}\n")
+
+#     trainer.fit(module, train_dataloaders=loader)
+
+
+# if __name__ == "__main__":
+#     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import math
+import argparse
+import os
+import torch
+import torch.nn as nn
+from torch.optim.optimizer import Optimizer
+from torch.utils.data import DataLoader, Dataset
+
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import Callback
+from pytorch_lightning.strategies import DDPStrategy
+from pytorch_lightning.loggers import WandbLogger
+
+from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedule_with_warmup
+from peft import LoraConfig, get_peft_model, TaskType
+from datasets import load_dataset, load_from_disk
+
+
+# ============================================================================ #
+#                            Muon & mu-GREATS Math                             #
+# ============================================================================ #
+def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
+    assert G.ndim == 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    if G.size(0) > G.size(1):
+        G = G.t(); transposed = True
+    else:
+        transposed = False
+    norm = G.norm() + eps
+    X = G / norm
+    X = X.bfloat16()
+    for _ in range(steps):
+        A = X.t() @ X
+        B = b * A + c * A @ A
+        X = X @ (a * torch.eye(X.size(1), device=X.device, dtype=X.dtype) + B)
+    if transposed:
+        X = X.t()
+    return X.float()
+
+
+def project_to_stiefel_tangent(theta, grad):
+    theta = theta.to(grad.dtype)
+    theta_t_grad = theta.t() @ grad
+    symm_term = (theta_t_grad + theta_t_grad.t()) / 2.0
+    return grad - (theta @ symm_term)
+
+
+# ============================================================================ #
+#                           Muon Optimizer                                     #
+# ============================================================================ #
+class Muon(Optimizer):
+    def __init__(self, params, lr=0.0005, momentum=0.95, nesterov=True,
+                 ns_steps=5, adam_w_lr=0.0002, adam_w_betas=(0.9, 0.999),
+                 weight_decay=0.2, adam_w_weight_decay=0.01, eps=1e-8):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
+                        ns_steps=ns_steps, adam_w_lr=adam_w_lr,
+                        adam_w_betas=adam_w_betas, weight_decay=weight_decay, 
+                        adam_w_weight_decay=adam_w_weight_decay, eps=eps)
+        super().__init__(params, defaults)
+        self.batch_utility_score = 0.0
+
+    def _classify_param(self, p):
+        is_embedding = (p.ndim == 2 and p.size(0) > 10000)
+        return p.ndim == 2 and not is_embedding
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        total_utility = 0.0
+        for group in self.param_groups:
+            lr = group['lr']; momentum = group['momentum']
+            nesterov = group['nesterov']; ns_steps = group['ns_steps']
+            weight_decay = group['weight_decay']; adam_lr = group['adam_w_lr']
+            beta1, beta2 = group['adam_w_betas']; eps = group['eps']
+            adam_w_wd = group['adam_w_weight_decay'] # Added distinct AdamW WD
+
+            for p in group['params']:
+                grad = p.grad
+                if grad is None:
+                    continue
+                state = self.state[p]
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['use_muon'] = self._classify_param(p)
+                    state['momentum_buffer'] = torch.zeros_like(p)
+                    state['exp_avg'] = torch.zeros_like(p)
+                    state['exp_avg_sq'] = torch.zeros_like(p)
+
+                state['step'] += 1
+                if state['use_muon']:
+                    stiefel_grad = project_to_stiefel_tangent(p, grad)
+                    total_utility += torch.norm(stiefel_grad, p='fro').item()
+                    if weight_decay != 0:
+                        p.mul_(1 - lr * weight_decay)
+                    buf = state['momentum_buffer']
+                    buf.mul_(momentum).add_(grad, alpha=1 - momentum)
+                    g = buf.clone().add_(grad, alpha=1 - momentum) if nesterov else buf
+                    g_ortho = zeropower_via_newtonschulz5(g, steps=ns_steps)
+                    rows, cols = g.size()
+                    g_ortho *= max(1, rows / cols) ** 0.5
+                    p.add_(g_ortho, alpha=-lr)
+                else:
+                    if adam_w_wd != 0:
+                        p.mul_(1 - adam_lr * adam_w_wd)
+                    exp_avg = state['exp_avg']
+                    exp_avg_sq = state['exp_avg_sq']
+                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                    bc1 = 1 - beta1 ** state['step']
+                    bc2 = 1 - beta2 ** state['step']
+                    step_size = adam_lr / bc1
+                    denom = (exp_avg_sq.sqrt() / math.sqrt(bc2)).add_(eps)
+                    p.addcdiv_(exp_avg, denom, value=-step_size)
+
+        self.batch_utility_score = total_utility
+        return loss
+
+
+# ============================================================================ #
+#                           Data: HuggingFace DatasetDict                      #
+# ============================================================================ #
+class TextDataset(Dataset):
+    def __init__(self, tokenizer, data_dir, split="train", seq_length=2048):
+        self.seq_length = seq_length
+        
+        # Load the Hugging Face DatasetDict from the directory
+        dataset_dict = load_from_disk(data_dir)
+        raw = dataset_dict[split]
+
+        # Standardize the target text column based on typical generated formats
+        if "text" in raw.column_names:
+            texts = [str(t) for t in raw["text"]] 
+        elif "instruction" in raw.column_names and "output" in raw.column_names:
+            texts = [f"Instruction: {row['instruction']}\nOutput: {row['output']}" for row in raw]
+        else:
+            texts = [str(row) for row in raw]
+
+        tokens = tokenizer(
+            texts,
+            truncation=True,
+            max_length=seq_length,
+            padding="max_length",
+            return_tensors="pt",
+        )
+        self.input_ids = tokens["input_ids"]
+        self.attention_mask = tokens["attention_mask"]
+
+    def __len__(self):
+        return len(self.input_ids)
+
+    def __getitem__(self, idx):
+        ids = self.input_ids[idx]
+        mask = self.attention_mask[idx]
+        return {"input_ids": ids, "attention_mask": mask, "labels": ids.clone()}
+
+
+# ============================================================================ #
+#                     PyTorch Lightning Module                                 #
+# ============================================================================ #
+class LlamaLoRALightningModule(pl.LightningModule):
+    def __init__(self, model_name, lora_config, lr, adam_w_lr, weight_decay, adam_w_weight_decay, momentum, adam_beta1):
+        super().__init__()
+        self.save_hyperparameters(ignore=["lora_config"])
+        self.batch_utility_score = 0.0
+
+        # Load model in bf16
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            dtype=torch.bfloat16,
+        )
+        self.model = get_peft_model(self.model, lora_config)
+        self.model.print_trainable_parameters()
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        return self.model(input_ids=input_ids,
+                          attention_mask=attention_mask,
+                          labels=labels)
+
+    def training_step(self, batch, batch_idx):
+        outputs = self(**batch)
+        loss = outputs.loss
+        ppl = torch.exp(loss.detach())
+        
+        self.log("train/loss", loss, prog_bar=True, on_step=True)
+        self.log("train/perplexity", ppl, prog_bar=True, on_step=True)
+        self.log("train/mu_greats_batch_utility", self.batch_utility_score, prog_bar=True, on_step=True)
+        
+        # Log learning rates dynamically
+        opt = self.optimizers()
+        if opt:
+            self.log("lr/muon", opt.param_groups[0]['lr'])
+            if len(opt.param_groups) > 1:
+                self.log("lr/adamw", opt.param_groups[1]['lr'])
+                
+        return loss
+
+    def on_after_backward(self):
+        # Capture mu-GREATS utility from the optimizer after grads are computed
+        for opt in self.trainer.optimizers:
+            if isinstance(opt, Muon):
+                self.batch_utility_score = opt.batch_utility_score
+
+    def configure_optimizers(self):
+        params = [p for p in self.parameters() if p.requires_grad]
+        print(f"[Muon] Trainable LoRA params: {len(params)}")
+        
+        optimizer = Muon(
+            params,
+            lr=self.hparams.lr,
+            momentum=self.hparams.momentum,
+            weight_decay=self.hparams.weight_decay,
+            adam_w_lr=self.hparams.adam_w_lr,
+            adam_w_weight_decay=self.hparams.adam_w_weight_decay,
+            adam_w_betas=(self.hparams.adam_beta1, 0.999)
+        )
+        
+        # Linear Scheduler 
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=int(0.05 * self.trainer.max_steps), # 5% warmup duration
+            num_training_steps=self.trainer.max_steps,
+        )
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            },
+        }
+
+
+# ============================================================================ #
+#                                Main Function                                 #
+# ============================================================================ #
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name", type=str, default="meta-llama/Meta-Llama-3-8B")
+    parser.add_argument("--data_dir", type=str, default="data", 
+                        help="Directory containing Hugging Face DatasetDict")
+    parser.add_argument("--seq_length", type=int, default=2048)
+    parser.add_argument("--global_batch_size", type=int, default=16)
+    parser.add_argument("--micro_batch_size", type=int, default=1)
+    
+    # -------------------------------------------------------------
+    # Hyperparameters from Image (Exp 1)
+    # -------------------------------------------------------------
+    parser.add_argument("--lr", type=float, default=0.0005)              # Muon LR
+    parser.add_argument("--weight_decay", type=float, default=0.2)       # Muon WD
+    parser.add_argument("--momentum", type=float, default=0.95)          # Muon Momentum
+    parser.add_argument("--adam_lr", type=float, default=0.0002)         # AdamW LR
+    parser.add_argument("--adam_weight_decay", type=float, default=0.01) # AdamW WD
+    parser.add_argument("--adam_beta1", type=float, default=0.9)         # AdamW Beta1 (Momentum)
+    parser.add_argument("--lora_rank", type=int, default=16)             # LoRA Rank
+    parser.add_argument("--lora_dropout", type=float, default=0.05)      # LoRA Dropout
+    
+    parser.add_argument("--max_steps", type=int, default=150)
+    parser.add_argument("--devices", type=int, default=1)
+    args = parser.parse_args()
+
+    torch.set_float32_matmul_precision("high")
+
+    # W&B Logger setup
+    wandb_logger = WandbLogger(project="llama3-lora-muon", name="Exp-1-Vanilla-LoRA")
+
+    # 1. Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # 2. LoRA config (HuggingFace PEFT)
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=args.lora_rank,
+        lora_alpha=128, 
+        lora_dropout=args.lora_dropout,
+        target_modules=["q_proj", "k_proj", "v_proj",
+                        "o_proj", "gate_proj", "up_proj", "down_proj"],
+        bias="none",
+    )
+
+    # 3. Lightning module
+    module = LlamaLoRALightningModule(
+        model_name=args.model_name,
+        lora_config=lora_config,
+        lr=args.lr,
+        adam_w_lr=args.adam_lr,
+        weight_decay=args.weight_decay,
+        adam_w_weight_decay=args.adam_weight_decay,
+        momentum=args.momentum,
+        adam_beta1=args.adam_beta1
+    )
+
+    # 4. Data
+    dataset = TextDataset(tokenizer, args.data_dir, split="train", seq_length=args.seq_length)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.micro_batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    # 5. Trainer
+    strategy = DDPStrategy(find_unused_parameters=False) if args.devices > 1 else "auto"
+    trainer = pl.Trainer(
+        logger=wandb_logger,            # Pass W&B to trainer
+        devices=args.devices,
+        num_nodes=1,
+        max_steps=args.max_steps,
+        accelerator="gpu",
+        strategy=strategy,
+        precision="bf16-true",          # native torch bf16
+        log_every_n_steps=1,
+        gradient_clip_val=1.0,
+        accumulate_grad_batches=args.global_batch_size // args.micro_batch_size,
+    )
+
+    print(f"\n{'='*70}")
+    print(f"[START] Exp 1: Llama3-8B Vanilla LoRA + Muon (W&B Active)")
+    print(f"{'='*70}\n")
+
+    trainer.fit(module, train_dataloaders=loader)
+
+
+if __name__ == "__main__":
+    main()
