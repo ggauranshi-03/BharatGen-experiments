@@ -1,3 +1,5 @@
 WanDB report for Exp-1: https://api.wandb.ai/links/dcll-iiitd/8endsbc8
 
 WanDB report for Exp-1a: https://api.wandb.ai/links/dcll-iiitd/42atlht5
+
+MOE experiments: https://wandb.ai/dcll-iiitd/nemo-moe-muon/reports/Muon-vs-AdamW-for-MoE-1-1B-model--VmlldzoxNjcyOTYxMw
